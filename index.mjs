@@ -3,21 +3,18 @@
 // 推理走 https://api.modelbest.cn/v1（OpenAI 兼容）；积分与签到走控制台
 // https://platform.modelbest.cn/api（Bearer = 网页里的 map_token）。
 //
-// 控制台 token 是 7 天的 JWT，没有 refresh 接口，只能重新登录一次控制台；
-// 而控制台登录强制滑块（captcha_enabled: true）。所以这里给两条登录路：
+// magpie 通常跑在服务器或容器里，那里没有浏览器可以借，所以登录只能在服务端完成：
+// 账号密码 → 自动过滑块 → 换 console token → 顺手取/建 API key。
+// 用户只需要输一次账号密码，之后每次续期都是这套流程，不需要人管。
 //
-//   A. 浏览器登录（推荐）：插件自己开一个隔离的 Chrome 窗口，你在里面登录，
-//      它从页面 localStorage 把 token 读走，顺手把 API key 也取出来。
-//      → 不需要在任何输入框里填东西，点一下就行。
-//   B. 填 API key：老路子，适合不想被弹窗的人；顺手填账号密码就能永久自动续。
+// 控制台 token 是 7 天 JWT，没有 refresh 接口，只能重新登录；登录强制滑块
+// （captcha_enabled: true），所以解滑块的代码是必需品，不是可选优化。
 import { decode, findGap } from "./slider.mjs";
-import { loginInBrowser } from "./browser.mjs";
 
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.3.0";
-const RENEW_BEFORE = 3 * 24 * 3600 * 1000;
+const UA = "magpie-modelbest/0.4.0";
 const LOGIN_TRIES = 8;
 
 // 模型快照（/api/models 与 /v1/models）。只收 chat 模型：
@@ -52,7 +49,7 @@ const modelOf = (id) => {
   };
 };
 
-// ---------- 凭据 ----------
+// ---------- 控制台 ----------
 
 function tokenExp(token) {
   try {
@@ -63,7 +60,7 @@ function tokenExp(token) {
   }
 }
 
-// 浏览器登录的账号是 oauth 类型（token 在 access）；填 key 的账号是 api 类型
+// oauth 账号 token 在 access；填 key 降级登录的账号在 metadata.consoleToken
 const consoleTokenOf = (auth) =>
   (auth?.type === "oauth" ? auth.access : auth?.metadata?.consoleToken || auth?.consoleToken) || "";
 const apiKeyOf = (auth) => (auth?.type === "oauth" ? auth.apiKey : auth?.key) || "";
@@ -94,13 +91,13 @@ async function consoleGet(token, path, init) {
   const body = await res.json().catch(() => null);
   // 控制台对失效会话既可能回 401，也可能回 HTTP 200 + code 10001
   if (res.status === 401 || body?.code === 10001) {
-    throw Object.assign(new Error("ModelBest 控制台 token 已过期，请重新登录插件"), { signIn: "expired" });
+    throw Object.assign(new Error("ModelBest 控制台登录已失效，请重新登录插件"), { signIn: "expired" });
   }
   if (!res.ok || (body && body.code !== 0)) throw new Error(body?.message || `控制台回答 ${res.status}`);
   return body?.data;
 }
 
-// 拿这个账号的推理 key：已有一个就用它，没有就建一个
+// API key 也由插件自己搞定，用户不用去控制台复制
 async function apiKeyFrom(token) {
   const keys = await consoleGet(token, "/keys"); // token 失效会在这里抛 signIn: expired，别吞掉
   const list = keys?.list ?? (Array.isArray(keys) ? keys : []);
@@ -114,11 +111,11 @@ async function apiKeyFrom(token) {
   if (!projectId) throw new Error("这个账号下没有可用的 API key，也拿不到默认项目，请先去控制台建一个");
   const created = await cpost(`/projects/${projectId}/keys`, { name: "magpie" }, token);
   const secret = created.json?.data?.secret ?? created.json?.data?.key;
-  if (!secret) throw new Error(`自动创建 API key 失败：${created.json?.message ?? "未知原因"}，请去控制台手动建一个`);
+  if (!secret) throw new Error(`自动创建 API key 失败：${created.json?.message ?? "未知原因"}`);
   return secret;
 }
 
-// ---------- 滑块登录（填了账号密码时用，不弹窗） ----------
+// ---------- 滑块登录 ----------
 
 async function solveCaptcha() {
   for (let i = 0; i < 3; i++) {
@@ -132,7 +129,7 @@ async function solveCaptcha() {
     const v = await cpost("/auth/captcha/verify", { id: cap.id, x: hit.x, y: cap.tile_y });
     if (v.json?.code === 0 && v.json?.data?.passed && v.json.data.id) return v.json.data.id;
   }
-  throw new Error("滑块没解出来，换一次登录试试");
+  throw new Error("滑块没解出来，稍后重试");
 }
 
 async function passwordLogin(account, password) {
@@ -143,12 +140,21 @@ async function passwordLogin(account, password) {
     const { json } = await cpost("/auth/login", { account, password, captcha_id: captchaId });
     if (json?.code === 0 && json.data?.token) return json.data.token;
     if (json?.data?.step_up_required) {
-      throw new Error("这个账号要邮箱二次验证，自动登录走不通，请点「用浏览器登录」");
+      throw new Error("这个账号要邮箱二次验证，自动登录走不通，请改用「直接填 API key」并手动补控制台 token");
     }
     last = json?.message ?? `code ${json?.code}`;
-    if (json?.code !== 20013) break;
+    if (json?.code !== 20013) break; // 20013 是「人机验证未通过」，换张图继续
   }
   throw new Error(`ModelBest 登录失败：${last}`);
+}
+
+// 账号密码 → 一整套凭据（token + api key）
+async function credentialFrom(account, password) {
+  const token = await passwordLogin(account, password);
+  const apiKey = await apiKeyFrom(token);
+  const expires = tokenExp(token);
+  const me = await consoleGet(token, "/me").catch(() => null);
+  return { token, apiKey, expires, username: me?.username };
 }
 
 // ---------- 插件 ----------
@@ -168,30 +174,43 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
     provider: PROVIDER,
     methods: [
       {
+        // 用 oauth 类型只是为了绕开 api 类型那个「必须填 API key」的输入框：
+        // 这里 opened + 空 url 让 magpie 什么都不打开，callback 立刻开跑，登录全在服务端完成。
         type: "oauth",
-        label: "用浏览器登录 ModelBest（推荐）",
-        async authorize() {
-          // ⚠ 这里必须立刻返回：真正等用户的是 callback()，在 authorize 里 await 会和 magpie 死锁
+        label: "ModelBest 账号登录（推荐）",
+        prompts: [
+          {
+            type: "text",
+            key: "account",
+            message: "ModelBest 账号（手机号或邮箱）",
+            placeholder: "登录 platform.modelbest.cn 用的那个",
+          },
+          { type: "password", key: "password", message: "ModelBest 密码" },
+        ],
+        async authorize(inputs) {
+          // ⚠ 必须立刻返回，等用户在 callback 里，在 authorize 里 await 会和 magpie 死锁
           return {
             url: "",
-            opened: true, // 窗口我们自己开，让 magpie 别再开系统浏览器
+            opened: true,
             method: "auto",
-            instructions:
-              "1) 会弹出一个独立的 Chrome 窗口（不碰你日常浏览器的登录状态）\n" +
-              "2) 在里面登录 ModelBest 控制台\n" +
-              "3) 登录成功窗口会自己关掉，API key 也会自动取好",
-            async callback(_url, _input, signal) {
-              const { token, expires } = await loginInBrowser({ timeoutMs: 5 * 60_000, signal });
-              const apiKey = await apiKeyFrom(token);
-              const me = await consoleGet(token, "/me").catch(() => null);
+            instructions: "正在用这个账号登录 ModelBest 控制台（自动过滑块），几秒就好…",
+            async callback() {
+              const { account, password } = inputs ?? {};
+              if (!account || !password) throw new Error("需要账号和密码才能登录");
+              const c = await credentialFrom(account, password);
               return {
                 type: "success",
-                access: token,
-                refresh: "browser-profile", // 有值才会被写进 plugin-auth.json；续期靠重开浏览器
-                expires,
-                apiKey,
-                ...(me?.username ? { accountId: me.username } : {}),
-                metadata: { consoleToken: token, consoleExpires: expires },
+                access: c.token,
+                refresh: "account-password", // 有值才会被写进 plugin-auth.json
+                expires: c.expires,
+                apiKey: c.apiKey,
+                ...(c.username ? { accountId: c.username } : {}),
+                metadata: {
+                  account,
+                  password,
+                  consoleToken: c.token,
+                  consoleExpires: c.expires,
+                },
               };
             },
           };
@@ -199,38 +218,34 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
       },
       {
         type: "api",
-        label: "直接填 API key",
+        label: "直接填 API key（不存密码）",
         placeholder: "sk-live-…",
         prompts: [
           {
-            type: "text",
-            key: "account",
-            message: "控制台账号（可选，填了就不用再弹窗）",
-            placeholder: "手机号或邮箱",
-          },
-          {
             type: "password",
-            key: "password",
-            message: "控制台密码（可选，填了自动续期就不打扰你）",
+            key: "consoleToken",
+            message: "控制台 token（可选，用于积分与签到）",
+            placeholder: "已登录网页 F12 里 localStorage.map_token",
           },
         ],
       },
     ],
 
-    // magpie 在 expires 前自动调用（oauth 账号）
+    // magpie 在 expires 前自动调用，账号密码都在，静默换一套新的
     async refresh(auth) {
       const meta = auth?.metadata ?? {};
-      // 填过账号密码：滑块静默登录，不弹窗
-      if (meta.account && meta.password) {
-        const token = await passwordLogin(meta.account, meta.password);
-        const expires = tokenExp(token);
-        const apiKey = await apiKeyFrom(token).catch(() => auth.apiKey);
-        return { access: token, expires, apiKey, metadata: { ...meta, consoleToken: token, consoleExpires: expires } };
+      if (!meta.account || !meta.password) {
+        throw Object.assign(new Error("没有可用的账号密码，无法自动续期，请重新登录插件"), {
+          signIn: "expired",
+        });
       }
-      // 否则重开登录窗口；profile 里还留着登录态时会一闪而过
-      const { token, expires } = await loginInBrowser({ timeoutMs: 3 * 60_000 });
-      const apiKey = await apiKeyFrom(token).catch(() => auth.apiKey);
-      return { access: token, expires, apiKey, metadata: { ...meta, consoleToken: token, consoleExpires: expires } };
+      const c = await credentialFrom(meta.account, meta.password);
+      return {
+        access: c.token,
+        expires: c.expires,
+        apiKey: c.apiKey,
+        metadata: { ...meta, consoleToken: c.token, consoleExpires: c.expires },
+      };
     },
 
     async loader(getAuth) {
