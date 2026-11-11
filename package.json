@@ -1,6 +1,6 @@
 {
   "name": "magpie-modelbest",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "ModelBest (面壁智能 / MiniCPM) provider plugin for magpie and OpenCode — server-side sign-in with account and password, credit balance, daily check-in, silent token renewal",
   "type": "module",
   "main": "./index.mjs",
@@ -18,7 +18,7 @@
   "magpie": {
     "name": "ModelBest 面壁智能",
     "summary": {
-      "zh": "面壁智能 MiniCPM：填一次账号密码，积分与每日签到直接显示，token 到期自动续（服务器可用，不需要浏览器）",
+      "zh": "面壁智能 MiniCPM：填一次账号密码，二次验证会弹框收码；积分与每日签到直接显示，token 到期自动续（服务器可用，不需要浏览器）",
       "en": "ModelBest MiniCPM: sign in once with account and password, credits and daily check-in, silent renewal — works headless on a server"
     },
     "maxConcurrency": 8,

@@ -5,16 +5,14 @@
 //
 // magpie 通常跑在服务器或容器里，那里没有浏览器可以借，所以登录只能在服务端完成：
 // 账号密码 → 自动过滑块 → 换 console token → 顺手取/建 API key。
-// 用户只需要输一次账号密码，之后每次续期都是这套流程，不需要人管。
-//
-// 控制台 token 是 7 天 JWT，没有 refresh 接口，只能重新登录；登录强制滑块
-// （captcha_enabled: true），所以解滑块的代码是必需品，不是可选优化。
+// 账号开了二次验证时，/auth/login 会返回 step_up_required（此时服务端已把验证码发到手机/邮箱），
+// 这里用 magpie 的 method: "code" 弹一个输入框让用户填 6 位码，填完换 token。
 import { decode, findGap } from "./slider.mjs";
 
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.4.0";
+const UA = "magpie-modelbest/0.5.0";
 const LOGIN_TRIES = 8;
 
 // 模型快照（/api/models 与 /v1/models）。只收 chat 模型：
@@ -115,7 +113,7 @@ async function apiKeyFrom(token) {
   return secret;
 }
 
-// ---------- 滑块登录 ----------
+// ---------- 滑块 ----------
 
 async function solveCaptcha() {
   for (let i = 0; i < 3; i++) {
@@ -132,29 +130,72 @@ async function solveCaptcha() {
   throw new Error("滑块没解出来，稍后重试");
 }
 
-async function passwordLogin(account, password) {
+// ---------- 密码登录（可能要求二次验证） ----------
+
+/**
+ * 第一步：解滑块 + POST /auth/login。
+ * 返回 { token } 或 { challengeToken, channel, notified }。
+ * 二次验证时服务端已经发了一条验证码，这里不用再调 resend。
+ */
+async function beginPasswordLogin(account, password) {
   let last = "";
   for (let i = 0; i < LOGIN_TRIES; i++) {
     const captchaId = await solveCaptcha().catch(() => null);
     if (!captchaId) continue;
     const { json } = await cpost("/auth/login", { account, password, captcha_id: captchaId });
-    if (json?.code === 0 && json.data?.token) return json.data.token;
-    if (json?.data?.step_up_required) {
-      throw new Error("这个账号要邮箱二次验证，自动登录走不通，请改用「直接填 API key」并手动补控制台 token");
+    if (json?.code === 0) {
+      const d = json.data ?? {};
+      if (d.token) return { token: d.token };
+      if (d.step_up_required && d.challenge_token) {
+        return {
+          challengeToken: d.challenge_token,
+          channel: d.verification_channel === "phone" ? "手机" : "邮箱",
+          notified: d.notification_status !== "failed",
+        };
+      }
     }
     last = json?.message ?? `code ${json?.code}`;
-    if (json?.code !== 20013) break; // 20013 是「人机验证未通过」，换张图继续
+    if (json?.code !== 20013) break; // 20013 = 人机验证未通过，换张图继续
   }
   throw new Error(`ModelBest 登录失败：${last}`);
 }
 
-// 账号密码 → 一整套凭据（token + api key）
-async function credentialFrom(account, password) {
-  const token = await passwordLogin(account, password);
+// 第二步（仅在要求二次验证时）：6 位验证码换 token
+async function verifyStepUp(challengeToken, code) {
+  const { json } = await cpost("/auth/password-login/verify", { challenge_token: challengeToken, code });
+  if (json?.code === 0 && json.data?.token) return json.data.token;
+  throw new Error(json?.message || "验证码不对，再试一次");
+}
+
+// 验证码没收到时可以重发
+async function resendStepUp(challengeToken) {
+  const { json } = await cpost("/auth/password-login/resend", { challenge_token: challengeToken });
+  return json?.data ?? null;
+}
+
+// token → 一整套凭据（顺便把 API key 也取好）
+async function credentialFromLogin(token) {
   const apiKey = await apiKeyFrom(token);
   const expires = tokenExp(token);
   const me = await consoleGet(token, "/me").catch(() => null);
   return { token, apiKey, expires, username: me?.username };
+}
+
+function successOf(c, inputs) {
+  return {
+    type: "success",
+    access: c.token,
+    refresh: "account-password", // 有值才会被写进 plugin-auth.json
+    expires: c.expires,
+    apiKey: c.apiKey,
+    ...(c.username ? { accountId: c.username } : {}),
+    metadata: {
+      account: inputs?.account,
+      password: inputs?.password,
+      consoleToken: c.token,
+      consoleExpires: c.expires,
+    },
+  };
 }
 
 // ---------- 插件 ----------
@@ -174,8 +215,8 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
     provider: PROVIDER,
     methods: [
       {
-        // 用 oauth 类型只是为了绕开 api 类型那个「必须填 API key」的输入框：
-        // 这里 opened + 空 url 让 magpie 什么都不打开，callback 立刻开跑，登录全在服务端完成。
+        // 用 oauth 类型是为了绕开 api 类型那个「必须填 API key」的输入框：
+        // opened + 空 url 让 magpie 什么都不打开，callback 立刻开跑，登录全在服务端完成。
         type: "oauth",
         label: "ModelBest 账号登录（推荐）",
         prompts: [
@@ -188,30 +229,42 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
           { type: "password", key: "password", message: "ModelBest 密码" },
         ],
         async authorize(inputs) {
-          // ⚠ 必须立刻返回，等用户在 callback 里，在 authorize 里 await 会和 magpie 死锁
+          const { account, password } = inputs ?? {};
+          if (!account || !password) throw new Error("需要账号和密码才能登录");
+
+          // 先把第一步做完，这样才能决定要不要弹验证码框
+          const first = await beginPasswordLogin(account, password);
+          const base = { url: "", opened: true };
+
+          // 不需要二次验证：直接成功，不打扰用户
+          if (first.token) {
+            return {
+              ...base,
+              method: "auto",
+              instructions: "正在完成登录…",
+              async callback() {
+                return successOf(await credentialFromLogin(first.token), inputs);
+              },
+            };
+          }
+
+          // 需要二次验证：magpie 会弹一个输入框，用户填 6 位验证码
           return {
-            url: "",
-            opened: true,
-            method: "auto",
-            instructions: "正在用这个账号登录 ModelBest 控制台（自动过滑块），几秒就好…",
-            async callback() {
-              const { account, password } = inputs ?? {};
-              if (!account || !password) throw new Error("需要账号和密码才能登录");
-              const c = await credentialFrom(account, password);
-              return {
-                type: "success",
-                access: c.token,
-                refresh: "account-password", // 有值才会被写进 plugin-auth.json
-                expires: c.expires,
-                apiKey: c.apiKey,
-                ...(c.username ? { accountId: c.username } : {}),
-                metadata: {
-                  account,
-                  password,
-                  consoleToken: c.token,
-                  consoleExpires: c.expires,
-                },
-              };
+            ...base,
+            method: "code",
+            instructions: first.notified
+              ? `验证码已发到你的${first.channel}，请输入 6 位数字`
+              : `验证码可能没发出去（${first.channel}），请输入收到的码；收不到就重新登录一次`,
+            async callback(code) {
+              const typed = String(code ?? "").trim();
+              if (!/^\d{6}$/.test(typed)) throw new Error("需要 6 位数字验证码");
+              try {
+                return successOf(await credentialFromLogin(await verifyStepUp(first.challengeToken, typed)), inputs);
+              } catch (e) {
+                // 输错了给一次重发机会，再错就让用户重来
+                await resendStepUp(first.challengeToken).catch(() => {});
+                throw e;
+              }
             },
           };
         },
@@ -231,15 +284,25 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
       },
     ],
 
-    // magpie 在 expires 前自动调用，账号密码都在，静默换一套新的
+    // magpie 在 expires 前自动调用。账号要求二次验证时这里没法弹框，标记为需要重新登录。
     async refresh(auth) {
       const meta = auth?.metadata ?? {};
       if (!meta.account || !meta.password) {
-        throw Object.assign(new Error("没有可用的账号密码，无法自动续期，请重新登录插件"), {
-          signIn: "expired",
-        });
+        throw Object.assign(new Error("没有可用的账号密码，无法自动续期，请重新登录插件"), { signIn: "expired" });
       }
-      const c = await credentialFrom(meta.account, meta.password);
+      let first;
+      try {
+        first = await beginPasswordLogin(meta.account, meta.password);
+      } catch (e) {
+        throw Object.assign(new Error(`自动续期失败：${e.message}`), { signIn: "expired" });
+      }
+      if (!first.token) {
+        throw Object.assign(
+          new Error("这个账号每次登录都要验证码，重新登录插件并填入收到的验证码即可"),
+          { signIn: "expired" },
+        );
+      }
+      const c = await credentialFromLogin(first.token);
       return {
         access: c.token,
         expires: c.expires,
@@ -351,4 +414,13 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
   },
 });
 
-export const _internal = { MODELS, modelOf, tokenExp, passwordLogin, solveCaptcha, apiKeyFrom, consoleGet };
+export const _internal = {
+  MODELS,
+  modelOf,
+  tokenExp,
+  solveCaptcha,
+  beginPasswordLogin,
+  verifyStepUp,
+  apiKeyFrom,
+  consoleGet,
+};
