@@ -1,55 +1,50 @@
-// 本地验证：注入真实凭据跑一遍插件的每个钩子
-import { ModelBestAuthPlugin, _internal } from "file:///D:/杂七杂八/magpie-modelbest/index.mjs";
+// 本地自测：先跑静态检查，有控制台 token 再跑真接口
+import { ModelBestAuthPlugin, _internal } from "./index.mjs";
+import { _internal as browser } from "./browser.mjs";
 
-const key = process.env.MB_KEY;
-const consoleToken = process.env.MB_CONSOLE;
-if (!key || !consoleToken) throw new Error("需要 MB_KEY 与 MB_CONSOLE");
+const plugin = await ModelBestAuthPlugin({ client: { auth: { set: async () => {} } } });
 
-// 假的 client.auth.set，记录插件想存回去的新 token
-const saved = [];
-const client = { auth: { set: async (args) => void saved.push(args) } };
+// ---- 静态部分（不需要凭据） ----
+const oauth = plugin.auth.methods.find((m) => m.type === "oauth");
+const t0 = Date.now();
+const flow = await oauth.authorize();
+console.log(`authorize: ${Date.now() - t0}ms, opened=${flow.opened}, method=${flow.method}`);
+console.log("methods:", plugin.auth.methods.map((m) => m.type).join(" | "));
 
-const plugin = await ModelBestAuthPlugin({ client });
+const empty = async () => ({ type: "oauth", access: "", apiKey: "" });
+console.log("空凭据 usage:", JSON.stringify(await plugin.auth.usage(empty)));
+console.log("空凭据 loader:", JSON.stringify(await plugin.auth.loader(empty)));
 
-const cfg = {};
-await plugin.config(cfg);
-const declared = cfg.provider.modelbest;
-console.log("provider:", declared.name, "| api:", declared.api);
-console.log("静态模型:", Object.keys(declared.models).join(", "));
+try {
+  await plugin.auth.usage(async () => ({ type: "oauth", access: "invalid.token.x" }));
+} catch (e) {
+  console.log("无效 token →", e.message, "| signIn:", e.signIn);
+}
 
-const auth = { type: "api", key, metadata: { consoleToken } };
+// ---- 真接口部分 ----
+const token = process.env.MB_CONSOLE || (await browser.evalOnce(9222, browser.READ_TOKEN).catch(() => ""));
+if (!token) {
+  console.log("\n没有可用的控制台 token，跳过真接口检查（设 MB_CONSOLE，或在 9222 上登录着 ModelBest）");
+  process.exit(0);
+}
+
+let apiKey;
+try {
+  apiKey = await _internal.apiKeyFrom(token);
+} catch (e) {
+  console.log("\n读到 token 但服务端不认（可能已失效）:", e.message);
+  process.exit(0);
+}
+console.log(`\n自动取到 API key: ${apiKey.slice(0, 8)}…(${apiKey.length} 字符)`);
+
+const auth = { type: "oauth", access: token, refresh: "browser-profile", expires: _internal.tokenExp(token), apiKey };
 const getAuth = async () => auth;
-
-console.log("token 剩余天数:", (_internal.tokenExp(consoleToken) - Date.now()) / 86400000 | 0);
+console.log("剩余天数:", Math.round((_internal.tokenExp(token) - Date.now()) / 86400000));
 console.log("loader:", JSON.stringify(await plugin.auth.loader(getAuth)));
 console.log("usage:", JSON.stringify(await plugin.auth.usage(getAuth)));
 console.log("checkin:", JSON.stringify(await plugin.auth.checkin(getAuth)));
-const live = await plugin.provider.models(declared, { auth });
+
+const cfg = {};
+await plugin.config(cfg);
+const live = await plugin.provider.models(cfg.provider.modelbest, { auth });
 console.log("在线模型:", Object.keys(live).length);
-
-// 用例 A：token 无效 + 没账号密码 → 不该发登录请求，直接报要重新登录
-const broken = { type: "api", key, metadata: { consoleToken: "invalid.token.value" } };
-try {
-  await plugin.auth.usage(async () => broken);
-  console.log("A 无效 token 且无账号密码: 没抛错（意料之外）");
-} catch (e) {
-  console.log("A 无效 token 且无账号密码 →", e.message, "| signIn:", e.signIn);
-}
-
-// 用例 B：token 无效 + 填了账号密码 → 应该真的走滑块登录，这里用假账号，预期登录失败
-const bad = {
-  type: "api",
-  key,
-  metadata: {
-    consoleToken: "invalid.token.value",
-    account: "probe@example.invalid",
-    password: "not-a-real-password",
-  },
-};
-try {
-  await plugin.auth.usage(async () => bad);
-  console.log("B 无效 token + 假账号: 没抛错（意料之外）");
-} catch (e) {
-  console.log("B 无效 token + 假账号 →", e.message);
-}
-console.log("client.auth.set 调用次数:", saved.length);

@@ -1,11 +1,11 @@
 {
   "name": "magpie-modelbest",
-  "version": "0.2.0",
-  "description": "ModelBest (面壁智能 / MiniCPM) provider plugin for magpie and OpenCode, with credit balance, daily check-in and automatic console-token renewal",
+  "version": "0.3.0",
+  "description": "ModelBest (面壁智能 / MiniCPM) provider plugin for magpie and OpenCode — one-click browser sign-in, credit balance, daily check-in, automatic token renewal",
   "type": "module",
   "main": "./index.mjs",
   "exports": { "./server": "./index.mjs" },
-  "files": ["index.mjs", "slider.mjs", "vendor/", "README.md", "LICENSE"],
+  "files": ["index.mjs", "slider.mjs", "browser.mjs", "vendor/", "README.md", "LICENSE"],
   "keywords": ["opencode", "opencode-plugin", "opencode-provider", "magpie", "modelbest", "minicpm"],
   "license": "MIT",
   "author": "samir2015dzh",
@@ -18,8 +18,8 @@
   "magpie": {
     "name": "ModelBest 面壁智能",
     "summary": {
-      "zh": "面壁智能 MiniCPM：积分余额、每日签到，控制台 token 到期自动续",
-      "en": "ModelBest MiniCPM with credit balance, daily check-in and automatic token renewal"
+      "zh": "面壁智能 MiniCPM：点一下浏览器登录，积分与每日签到直接显示，token 到期自动续",
+      "en": "ModelBest MiniCPM: one-click browser sign-in, credits and daily check-in, automatic token renewal"
     },
     "maxConcurrency": 8,
     "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0OCA0OCI+PHJlY3Qgd2lkdGg9IjQ4IiBoZWlnaHQ9IjQ4IiByeD0iMTIiIGZpbGw9IiMxYjFiMWYiLz48cGF0aCBkPSJNMTIgMzJsMTItMjAgMTIgMjB6IiBmaWxsPSIjZmZmIi8+PC9zdmc+"

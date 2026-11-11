@@ -1,19 +1,27 @@
 // magpie 供应商插件：ModelBest / 面壁智能（MiniCPM）
-// 推理走 https://api.modelbest.cn/v1（OpenAI 兼容）；
-// 积分与签到走控制台 https://platform.modelbest.cn/api（Bearer = 网页 localStorage 的 map_token）。
-// 那个 token 是 7 天的 JWT，没有 refresh 接口，续期只能重新登录一次控制台——登录要过滑块，
-// 所以这里带着一个滑块求解器（slider.mjs），填了账号密码就能自动换新的 token。
+//
+// 推理走 https://api.modelbest.cn/v1（OpenAI 兼容）；积分与签到走控制台
+// https://platform.modelbest.cn/api（Bearer = 网页里的 map_token）。
+//
+// 控制台 token 是 7 天的 JWT，没有 refresh 接口，只能重新登录一次控制台；
+// 而控制台登录强制滑块（captcha_enabled: true）。所以这里给两条登录路：
+//
+//   A. 浏览器登录（推荐）：插件自己开一个隔离的 Chrome 窗口，你在里面登录，
+//      它从页面 localStorage 把 token 读走，顺手把 API key 也取出来。
+//      → 不需要在任何输入框里填东西，点一下就行。
+//   B. 填 API key：老路子，适合不想被弹窗的人；顺手填账号密码就能永久自动续。
 import { decode, findGap } from "./slider.mjs";
+import { loginInBrowser } from "./browser.mjs";
 
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.2.0";
-const RENEW_BEFORE = 3 * 24 * 3600 * 1000; // 剩不到 3 天就续
-const LOGIN_TRIES = 8; // 滑块单次通过率约六七成，8 次足够
+const UA = "magpie-modelbest/0.3.0";
+const RENEW_BEFORE = 3 * 24 * 3600 * 1000;
+const LOGIN_TRIES = 8;
 
-// 模型快照（/api/models 与 /v1/models，2026-11-11）。只收 chat 模型：
-// MiniCPM-OCR-1.0 只有 document_parse 协议，VoxCPM2 是语音合成，MiniCPM-o-4.5-Realtime 走实时通道，都不在这里。
+// 模型快照（/api/models 与 /v1/models）。只收 chat 模型：
+// MiniCPM-OCR-1.0 只有 document_parse 协议，VoxCPM2 是语音合成，MiniCPM-o-4.5-Realtime 走实时通道。
 const MODELS = {
   "MiniCPM-V-4.6": { ctx: 256000, image: true, video: true, toolcall: true, cost: [0.2, 1.6] },
   "MiniCPM-V-4.7-35B-A3B": { ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, free: true },
@@ -24,7 +32,7 @@ const MODELS = {
   "MiniCPM-OCR-Jev": { ctx: 32000, image: true, file: true },
 };
 
-// 辅助函数不单独导出：magpie 会把导出的每个函数都当插件调用一遍，测试用的放 _internal 上
+// 入口只导出插件函数，辅助函数放 _internal，否则 magpie 会把每个导出函数都当插件跑
 const modelOf = (id) => {
   const m = MODELS[id] ?? {};
   const images = !!m.image;
@@ -44,11 +52,8 @@ const modelOf = (id) => {
   };
 };
 
-export const _internal = { MODELS, modelOf, tokenExp, passwordLogin, solveCaptcha };
+// ---------- 凭据 ----------
 
-// ---------- 控制台会话 ----------
-
-// JWT 里带 exp（秒），拿不到就当未知
 function tokenExp(token) {
   try {
     const p = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
@@ -58,62 +63,22 @@ function tokenExp(token) {
   }
 }
 
-async function cpost(path, body) {
+// 浏览器登录的账号是 oauth 类型（token 在 access）；填 key 的账号是 api 类型
+const consoleTokenOf = (auth) =>
+  (auth?.type === "oauth" ? auth.access : auth?.metadata?.consoleToken || auth?.consoleToken) || "";
+const apiKeyOf = (auth) => (auth?.type === "oauth" ? auth.apiKey : auth?.key) || "";
+
+async function cpost(path, body, token) {
   const res = await fetch(CONSOLE + path, {
     method: "POST",
-    headers: { "content-type": "application/json", "accept-language": "zh-CN" },
+    headers: {
+      "content-type": "application/json",
+      "accept-language": "zh-CN",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body ?? {}),
   });
   return { status: res.status, json: await res.json().catch(() => null) };
-}
-
-// 取一张滑块图算缺口位置，verify 通过后拿 captcha_id；不过就换一张
-async function solveCaptcha() {
-  for (let i = 0; i < 3; i++) {
-    const { json } = await cpost("/auth/captcha", {});
-    const cap = json?.data;
-    if (!cap?.master_b64 || !cap?.tile_b64) continue;
-    const tile = decode(cap.tile_b64);
-    const hit = findGap(decode(cap.master_b64), tile.w, tile.h);
-    if (hit.x < 0) continue;
-    const v = await cpost("/auth/captcha/verify", { id: cap.id, x: hit.x, y: cap.tile_y });
-    if (v.json?.code === 0 && v.json?.data?.passed && v.json.data.id) return v.json.data.id;
-  }
-  throw new Error("滑块没解出来");
-}
-
-async function passwordLogin(account, password) {
-  let last = "";
-  for (let i = 0; i < LOGIN_TRIES; i++) {
-    const captchaId = await solveCaptcha().catch(() => null);
-    if (!captchaId) continue;
-    const { json } = await cpost("/auth/login", { account, password, captcha_id: captchaId });
-    if (json?.code === 0 && json.data?.token) return json.data.token;
-    if (json?.data?.step_up_required) {
-      throw new Error("ModelBest 要求邮箱二次验证，自动续期走不通；请在网页登录后把新 token 重新填进插件");
-    }
-    last = json?.message ?? `HTTP ${json?.code ?? "?"}`;
-    if (json?.code !== 20013) break; // 20013 是「人机验证未通过」，换张图再来
-  }
-  throw new Error(`ModelBest 登录失败：${last}`);
-}
-
-// 控制台 token 快过期就用账号密码自动换一张。续不动就返回旧的，让厂商那边去报错。
-async function ensureConsole(auth, client) {
-  const meta = auth?.metadata ?? {};
-  const token = meta.consoleToken || auth?.consoleToken || "";
-  const exp = meta.consoleExpires || tokenExp(token);
-  const fresh = token && exp - Date.now() > RENEW_BEFORE;
-  if (fresh || !meta.account || !meta.password) return token;
-
-  const next = await passwordLogin(meta.account, meta.password);
-  await client?.auth
-    ?.set({
-      path: { id: PROVIDER },
-      body: { ...auth, metadata: { ...meta, consoleToken: next, consoleExpires: tokenExp(next) } },
-    })
-    .catch(() => {});
-  return next;
 }
 
 async function consoleGet(token, path, init) {
@@ -127,15 +92,66 @@ async function consoleGet(token, path, init) {
     },
   });
   const body = await res.json().catch(() => null);
-  // 控制台对失效会话既可能回 401，也可能回 HTTP 200 + code 10001（登录令牌缺失或无效）
+  // 控制台对失效会话既可能回 401，也可能回 HTTP 200 + code 10001
   if (res.status === 401 || body?.code === 10001) {
     throw Object.assign(new Error("ModelBest 控制台 token 已过期，请重新登录插件"), { signIn: "expired" });
   }
-  if (!res.ok || (body && body.code !== 0)) {
-    throw new Error(body?.message || `控制台回答 ${res.status}`);
-  }
+  if (!res.ok || (body && body.code !== 0)) throw new Error(body?.message || `控制台回答 ${res.status}`);
   return body?.data;
 }
+
+// 拿这个账号的推理 key：已有一个就用它，没有就建一个
+async function apiKeyFrom(token) {
+  const keys = await consoleGet(token, "/keys"); // token 失效会在这里抛 signIn: expired，别吞掉
+  const list = keys?.list ?? (Array.isArray(keys) ? keys : []);
+  const usable = list.find((k) => k?.status !== "disabled") ?? list[0];
+  if (usable?.id) {
+    const secret = await consoleGet(token, `/keys/${usable.id}/secret`).catch(() => null);
+    if (secret?.secret) return secret.secret;
+  }
+  const me = await consoleGet(token, "/me").catch(() => null);
+  const projectId = me?.default_project_id;
+  if (!projectId) throw new Error("这个账号下没有可用的 API key，也拿不到默认项目，请先去控制台建一个");
+  const created = await cpost(`/projects/${projectId}/keys`, { name: "magpie" }, token);
+  const secret = created.json?.data?.secret ?? created.json?.data?.key;
+  if (!secret) throw new Error(`自动创建 API key 失败：${created.json?.message ?? "未知原因"}，请去控制台手动建一个`);
+  return secret;
+}
+
+// ---------- 滑块登录（填了账号密码时用，不弹窗） ----------
+
+async function solveCaptcha() {
+  for (let i = 0; i < 3; i++) {
+    const { json } = await cpost("/auth/captcha", {});
+    const cap = json?.data;
+    if (!cap?.master_b64 || !cap?.tile_b64) continue;
+    const tile = decode(cap.tile_b64);
+    const hit = findGap(decode(cap.master_b64), tile.w, tile.h);
+    if (hit.x < 0) continue;
+    // go-captcha 的 confirm 给的是拼图最终 left（绝对坐标），不是拖拽位移
+    const v = await cpost("/auth/captcha/verify", { id: cap.id, x: hit.x, y: cap.tile_y });
+    if (v.json?.code === 0 && v.json?.data?.passed && v.json.data.id) return v.json.data.id;
+  }
+  throw new Error("滑块没解出来，换一次登录试试");
+}
+
+async function passwordLogin(account, password) {
+  let last = "";
+  for (let i = 0; i < LOGIN_TRIES; i++) {
+    const captchaId = await solveCaptcha().catch(() => null);
+    if (!captchaId) continue;
+    const { json } = await cpost("/auth/login", { account, password, captcha_id: captchaId });
+    if (json?.code === 0 && json.data?.token) return json.data.token;
+    if (json?.data?.step_up_required) {
+      throw new Error("这个账号要邮箱二次验证，自动登录走不通，请点「用浏览器登录」");
+    }
+    last = json?.message ?? `code ${json?.code}`;
+    if (json?.code !== 20013) break;
+  }
+  throw new Error(`ModelBest 登录失败：${last}`);
+}
+
+// ---------- 插件 ----------
 
 export const ModelBestAuthPlugin = async ({ client } = {}) => ({
   config: async (cfg) => {
@@ -152,44 +168,82 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
     provider: PROVIDER,
     methods: [
       {
+        type: "oauth",
+        label: "用浏览器登录 ModelBest（推荐）",
+        async authorize() {
+          // ⚠ 这里必须立刻返回：真正等用户的是 callback()，在 authorize 里 await 会和 magpie 死锁
+          return {
+            url: "",
+            opened: true, // 窗口我们自己开，让 magpie 别再开系统浏览器
+            method: "auto",
+            instructions:
+              "1) 会弹出一个独立的 Chrome 窗口（不碰你日常浏览器的登录状态）\n" +
+              "2) 在里面登录 ModelBest 控制台\n" +
+              "3) 登录成功窗口会自己关掉，API key 也会自动取好",
+            async callback(_url, _input, signal) {
+              const { token, expires } = await loginInBrowser({ timeoutMs: 5 * 60_000, signal });
+              const apiKey = await apiKeyFrom(token);
+              const me = await consoleGet(token, "/me").catch(() => null);
+              return {
+                type: "success",
+                access: token,
+                refresh: "browser-profile", // 有值才会被写进 plugin-auth.json；续期靠重开浏览器
+                expires,
+                apiKey,
+                ...(me?.username ? { accountId: me.username } : {}),
+                metadata: { consoleToken: token, consoleExpires: expires },
+              };
+            },
+          };
+        },
+      },
+      {
         type: "api",
-        label: "ModelBest API key",
+        label: "直接填 API key",
         placeholder: "sk-live-…",
         prompts: [
           {
             type: "text",
             key: "account",
-            message: "控制台账号（手机号或邮箱，用于自动续期，可留空）",
-            placeholder: "登录 platform.modelbest.cn 用的那个",
+            message: "控制台账号（可选，填了就不用再弹窗）",
+            placeholder: "手机号或邮箱",
           },
           {
             type: "password",
             key: "password",
-            message: "控制台密码（同上，可留空；只存在本机 plugin-auth.json）",
-          },
-          {
-            type: "password",
-            key: "consoleToken",
-            message: "控制台 token（可选）：积分与每日签到要用它",
-            placeholder: "localStorage.map_token，留空则用账号密码换",
+            message: "控制台密码（可选，填了自动续期就不打扰你）",
           },
         ],
       },
     ],
 
-    async loader(getAuth) {
-      const auth = await getAuth();
-      if (auth?.type !== "api") return {};
-      return { baseURL: API };
+    // magpie 在 expires 前自动调用（oauth 账号）
+    async refresh(auth) {
+      const meta = auth?.metadata ?? {};
+      // 填过账号密码：滑块静默登录，不弹窗
+      if (meta.account && meta.password) {
+        const token = await passwordLogin(meta.account, meta.password);
+        const expires = tokenExp(token);
+        const apiKey = await apiKeyFrom(token).catch(() => auth.apiKey);
+        return { access: token, expires, apiKey, metadata: { ...meta, consoleToken: token, consoleExpires: expires } };
+      }
+      // 否则重开登录窗口；profile 里还留着登录态时会一闪而过
+      const { token, expires } = await loginInBrowser({ timeoutMs: 3 * 60_000 });
+      const apiKey = await apiKeyFrom(token).catch(() => auth.apiKey);
+      return { access: token, expires, apiKey, metadata: { ...meta, consoleToken: token, consoleExpires: expires } };
     },
 
-    // 卡片上的积分数：余额来自 /billing/account，总量与到期来自 /billing/credit-packages，签到状态来自 /rewards
+    async loader(getAuth) {
+      const auth = await getAuth();
+      const key = apiKeyOf(auth);
+      return key ? { baseURL: API, apiKey: key } : { baseURL: API };
+    },
+
     async usage(getAuth) {
       const auth = await getAuth();
-      const token = await ensureConsole(auth, client);
-      if (!token) {
-        return { plan: "积分", error: "没填控制台 token 或账号密码：积分与签到读不到", windows: [] };
-      }
+      const token = consoleTokenOf(auth);
+      if (!token) return { plan: "积分", error: "还没登录控制台：积分与签到读不到", windows: [] };
+
       const [account, rewards, packs, me] = await Promise.all([
         consoleGet(token, "/billing/account"),
         consoleGet(token, "/rewards"),
@@ -200,15 +254,11 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
       const daily = Number(rewards?.daily_checkin_points ?? 0);
       const claimed = !!rewards?.claimed_today;
 
-      // 额度包：original_amount 是给过的总量，remaining_amount 是还剩的；包外的零散余额单列
-      const active = (packs?.list ?? []).filter(
-        (p) => p.status === "ACTIVE" || Number(p.remaining_amount) > 0,
-      );
+      const active = (packs?.list ?? []).filter((p) => p.status === "ACTIVE" || Number(p.remaining_amount) > 0);
       const loose = Number(packs?.other_available_balance ?? 0);
       const left = active.reduce((s, p) => s + Number(p.remaining_amount || 0), 0) + loose;
       const total = active.reduce((s, p) => s + Number(p.original_amount || 0), 0) + loose;
 
-      // 最早作废的一笔：magpie 用它在卡片上提示「xx 之后过期多少」
       let soonest = null;
       for (const p of active) {
         const at = Date.parse(p.expires_at ?? "");
@@ -242,14 +292,11 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
       };
     },
 
-    // magpie 每个北京日给每个账号调一次
     async checkin(getAuth) {
       const auth = await getAuth();
-      const token = await ensureConsole(auth, client);
+      const token = consoleTokenOf(auth);
       const before = await consoleGet(token, "/rewards");
-      if (before?.claimed_today) {
-        return { outcome: "done", message: `今日已签到（${before.reward_date}）` };
-      }
+      if (before?.claimed_today) return { outcome: "done", message: `今日已签到（${before.reward_date}）` };
       const r = await consoleGet(token, "/rewards/daily-checkins", { method: "POST", body: "{}" });
       if (r?.claimed) {
         return {
@@ -262,14 +309,12 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
     },
   },
 
-  // 每个账号问一次模型列表；失败就保留 config 里的静态表
   provider: {
     id: PROVIDER,
     async models(provider, { auth } = {}) {
-      if (auth?.type !== "api" || !auth.key) return provider.models;
-      const res = await fetch(`${API}/models`, {
-        headers: { authorization: `Bearer ${auth.key}`, "x-title": UA },
-      });
+      const key = apiKeyOf(auth);
+      if (!key) return provider.models;
+      const res = await fetch(`${API}/models`, { headers: { authorization: `Bearer ${key}`, "x-title": UA } });
       if (!res.ok) return provider.models;
       const { data } = await res.json().catch(() => ({}));
       if (!Array.isArray(data)) return provider.models;
@@ -290,3 +335,5 @@ export const ModelBestAuthPlugin = async ({ client } = {}) => ({
     },
   },
 });
+
+export const _internal = { MODELS, modelOf, tokenExp, passwordLogin, solveCaptcha, apiKeyFrom, consoleGet };
