@@ -12,7 +12,7 @@ import { decode, findGap } from "./slider.mjs";
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.5.0";
+const UA = "magpie-modelbest/0.5.1";
 const LOGIN_TRIES = 8;
 
 // 模型快照（/api/models 与 /v1/models）。只收 chat 模型：
@@ -136,6 +136,9 @@ async function solveCaptcha() {
  * 第一步：解滑块 + POST /auth/login。
  * 返回 { token } 或 { challengeToken, channel, notified }。
  * 二次验证时服务端已经发了一条验证码，这里不用再调 resend。
+ *
+ * 注意 data.code：控制台前端把它标成「当前环境验证码」，服务端在信任这个登录环境时
+ * 会把验证码直接回给客户端（省得用户去看手机）。有它就不用弹框。
  */
 async function beginPasswordLogin(account, password) {
   let last = "";
@@ -147,6 +150,12 @@ async function beginPasswordLogin(account, password) {
       const d = json.data ?? {};
       if (d.token) return { token: d.token };
       if (d.step_up_required && d.challenge_token) {
+        // 服务端把验证码直接给了（可信环境）：自己验掉，用户看不到这一步
+        if (/^\d{6}$/.test(String(d.code ?? ""))) {
+          const auto = await verifyStepUp(d.challenge_token, String(d.code)).catch(() => null);
+          if (auto) return { token: auto, autoStepUp: true };
+          // 猜错了就退回让用户填，别把人卡死
+        }
         return {
           challengeToken: d.challenge_token,
           channel: d.verification_channel === "phone" ? "手机" : "邮箱",
