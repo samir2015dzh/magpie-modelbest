@@ -12,28 +12,37 @@ import { decode, findGap } from "./slider.mjs";
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.5.3";
+const UA = "magpie-modelbest/0.5.4";
 const LOGIN_TRIES = 8;
 
 // 模型快照（/api/models 与 /v1/models）。
 //
-// reasoning 与 variants 是照着实测调的，不是照 capabilities 猜的：
-// 后端把 reasoning_effort 当开关用（minimal/low/medium/high 效果完全一样，none 或不给就不思考），
-// 而 1B 那个模型一开思考就停不下来，会把 max_tokens 全吃在思考里、正文返回空，
-// 所以只有 35B 标 reasoning: true 并给档位，1B 保持纯对话。
+// reasoning 是实测出来的：后端认 reasoning_effort，但把它当开关用——
+// minimal/low/medium/high 效果完全一样，none 或不给就看模型默认（MiniCPM5-* 默认就思考，
+// V-4.6/V-4.5 默认不思考）。除了 OCR-Jev 完全不认这个参数，其余模型都给档位。
+//
+// 注意：难题下这些模型可能停不下来，把 max_tokens 全耗在思考里、正文返回空
+// （V-4.7-1B / V-4.6 / V-4.5 用奥数题都复现过；简单问题正常）。这是模型行为，不是插件能修的。
+//
 // 只收 chat 模型：MiniCPM-OCR-1.0 只有 document_parse 协议，VoxCPM2 是语音合成，
 // MiniCPM-o-4.5-Realtime 走实时通道。
+const THINK = { low: {}, medium: {}, high: {} };
 const MODELS = {
   "MiniCPM-V-4.7-35B-A3B": {
-    ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, free: true,
-    variants: { low: {}, medium: {}, high: {} },
+    ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, variants: THINK, free: true,
   },
-  // 开思考会把 max_tokens 全耗在推理上、content 为空（实测 256/1024/4096 全是 finish=length + 空正文）
-  "MiniCPM-V-4.7-1B": { ctx: 256000, image: true, video: true, toolcall: true, free: true },
-  "MiniCPM-V-4.6": { ctx: 256000, image: true, video: true, toolcall: true, cost: [0.2, 1.6] },
-  "MiniCPM-V-4.5": { ctx: 40000, image: true, video: true, toolcall: true, cost: [0.2, 1.6] },
-  "MiniCPM5-2B": { ctx: 128000, cost: [0.15, 0.3] },
-  "MiniCPM5-1B": { ctx: 128000, toolcall: true, cost: [0.1, 0.2] },
+  "MiniCPM-V-4.7-1B": {
+    ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, variants: THINK, free: true,
+  },
+  "MiniCPM-V-4.6": {
+    ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, variants: THINK, cost: [0.2, 1.6],
+  },
+  "MiniCPM-V-4.5": {
+    ctx: 40000, image: true, video: true, toolcall: true, reasoning: true, variants: THINK, cost: [0.2, 1.6],
+  },
+  "MiniCPM5-2B": { ctx: 128000, reasoning: true, variants: THINK, cost: [0.15, 0.3] },
+  "MiniCPM5-1B": { ctx: 128000, reasoning: true, variants: THINK, toolcall: true, cost: [0.1, 0.2] },
+  // 唯一不认 reasoning_effort 的模型：加了也没反应，别给档位
   "MiniCPM-OCR-Jev": { ctx: 32000, image: true, file: true },
 };
 
@@ -53,7 +62,7 @@ const modelOf = (id) => {
     },
     modalities: { input: ["text", ...(images ? ["image"] : []), ...(m.video ? ["video"] : [])] },
     cost: { input: m.cost?.[0] ?? 0, output: m.cost?.[1] ?? 0 },
-    ...(m.variants ? { variants: m.variants } : {}),
+    ...(m.variants ? { variants: { ...m.variants } } : {}),
     ...(m.free ? { free: true } : {}),
   };
 };

@@ -67,40 +67,45 @@ magpie 一般装在服务器或容器里，那里没有浏览器可以借。而 
 
 后端把 `reasoning_effort` 当**开关**用，不是档位：
 
-| 请求里加什么 | 有没有思考 | reasoning_tokens |
+| 请求里加什么 | 结果 |
+| --- | --- |
+| 什么都不加 | 看模型默认：`MiniCPM5-*` 默认就思考，`V-4.6` / `V-4.5` 默认不思考 |
+| `reasoning_effort: "none"` | 关 |
+| `reasoning_effort: "minimal" / "low" / "medium" / "high"` | 开，**四个档位推理量完全一样**（都跑满预算） |
+| `chat_template_kwargs: {enable_thinking: true}` | 开，同上 |
+| `enable_thinking: true` / `thinking: {type:"enabled"}` | 无效，被忽略 |
+| `MiniCPM-OCR-Jev` 上的任何 effort | 无效，这个模型完全不认 |
+
+所以 magpie 里的低/中/高三档选哪个都一样：选任一档 = 开思考，不选 = 用模型默认。
+
+**简单问题实测都正常**（正文照常给出）：
+
+| 模型 | 不给参数 | 给 high |
 | --- | --- | --- |
-| 什么都不加 | ❌ | 0 |
-| `reasoning_effort: "none"` | ❌ | 0 |
-| `reasoning_effort: "minimal" / "low" / "medium" / "high"` | ✅ | 全部一样（都跑满预算） |
-| `chat_template_kwargs: {enable_thinking: true}` | ✅ | 同上 |
-| `enable_thinking: true` / `thinking: {type:"enabled"}` | ❌ | 0 |
+| `MiniCPM5-1B` | 已在思考，正文 77 字 | 思考 177 字，正文 50 字 |
+| `MiniCPM5-2B` | 已在思考，正文 45 字 | 思考 66 字，正文 37 字 |
+| `MiniCPM-V-4.6` | 不思考，正文 79 字 | 思考 105 字，正文 50 字 |
 
-所以 magpie 里的低/中/高三档选哪个都一样，选任一档 = 开思考，不选 = 不思考。
-
-**两个模型的表现差很多**：
-
-- `MiniCPM-V-4.7-35B-A3B` —— 开思考正常，finish=stop，思考完还会正常给正文（实测 1826 reasoning tokens + 193 字回答，约 9 秒）
-- `MiniCPM-V-4.7-1B` —— **不能开思考**。它会一直想，把 `max_tokens` 全耗在推理上然后返回空正文（256 / 1024 / 4096 三档实测全是 `finish_reason: length` + 空 content）
-
-因此插件里只有 35B 标了推理档位，1B 保持纯对话。如果你手动给 1B 设档位，回答会是空的。
+**但难题下它们可能停不下来**：思考会把 `max_tokens` 全吃光，`finish_reason: length`、正文为空。`V-4.7-1B`、`V-4.6`、`V-4.5` 用奥数题都复现过（256/1024/4096 三档全是空正文），`V-4.7-35B-A3B` 则能正常收尾（1826 reasoning tokens + 193 字回答）。这是模型本身的行为，不是插件能修的——遇到空回复就把思考档位取消，或者换 35B。
 
 ### 模型
 
 七个 chat 模型，按账号从 `GET /v1/models` 实时刷新：
 
-| 模型 | 上下文 | 说明 |
-| --- | --- | --- |
-| `MiniCPM-V-4.7-35B-A3B` | 256k | 免费，视觉、视频、**可开思考**、工具调用 |
-| `MiniCPM-V-4.7-1B` | 256k | 免费，视觉、视频、工具调用（开思考会返回空） |
-| `MiniCPM-V-4.6` | 256k | 视觉、视频、工具调用 |
-| `MiniCPM-V-4.5` | 40k | 视觉、视频、工具调用 |
-| `MiniCPM5-2B` | 128k | 文本 |
-| `MiniCPM5-1B` | 128k | 文本、工具调用 |
-| `MiniCPM-OCR-Jev` | 32k | 视觉、文件输入 |
+| 模型 | 上下文 | 思考档位 | 说明 |
+| --- | --- | --- | --- |
+| `MiniCPM-V-4.7-35B-A3B` | 256k | 低/中/高 | 免费，视觉、视频、工具调用，思考最稳 |
+| `MiniCPM-V-4.7-1B` | 256k | 低/中/高 | 免费，视觉、视频、工具调用 |
+| `MiniCPM-V-4.6` | 256k | 低/中/高 | 视觉、视频、工具调用 |
+| `MiniCPM-V-4.5` | 40k | 低/中/高 | 视觉、视频、工具调用 |
+| `MiniCPM5-2B` | 128k | 低/中/高 | 文本，默认就思考 |
+| `MiniCPM5-1B` | 128k | 低/中/高 | 文本、工具调用，默认就思考 |
+| `MiniCPM-OCR-Jev` | 32k | 无 | 视觉、文件输入，不认 reasoning 参数 |
 
 不列出的：`MiniCPM-OCR-1.0` 只有 `document_parse` 协议、`VoxCPM2` 是语音合成、`MiniCPM-o-4.5-Realtime` 走实时通道，都不吃 chat completions。
 
 最大输出：后端除 `MiniCPM-o-4.5-Realtime`（4096）外一律报 `max_output_tokens: 0`，插件填 8192 是保守默认，不是真实上限，可以在 magpie 的模型设置页直接改。
+
 
 
 ### 限制
