@@ -1,6 +1,6 @@
 {
   "name": "magpie-modelbest",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "ModelBest (面壁智能 / MiniCPM) provider plugin for magpie and OpenCode — server-side sign-in with account and password, credit balance, daily check-in, silent token renewal",
   "type": "module",
   "main": "./index.mjs",

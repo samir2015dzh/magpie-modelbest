@@ -12,12 +12,15 @@ import { decode, findGap } from "./slider.mjs";
 const PROVIDER = "modelbest";
 const API = "https://api.modelbest.cn/v1";
 const CONSOLE = "https://platform.modelbest.cn/api";
-const UA = "magpie-modelbest/0.5.2";
+const UA = "magpie-modelbest/0.5.3";
 const LOGIN_TRIES = 8;
 
 // 模型快照（/api/models 与 /v1/models）。
-// reasoning 只在 /v1/models 的 capabilities 里有 deep_thinking 的模型上为真：
-// 只有 V-4.7 两个模型有，其余（V-4.6 / V-4.5 / MiniCPM5-*）的 parameter_config 是空的。
+//
+// reasoning 与 variants 是照着实测调的，不是照 capabilities 猜的：
+// 后端把 reasoning_effort 当开关用（minimal/low/medium/high 效果完全一样，none 或不给就不思考），
+// 而 1B 那个模型一开思考就停不下来，会把 max_tokens 全吃在思考里、正文返回空，
+// 所以只有 35B 标 reasoning: true 并给档位，1B 保持纯对话。
 // 只收 chat 模型：MiniCPM-OCR-1.0 只有 document_parse 协议，VoxCPM2 是语音合成，
 // MiniCPM-o-4.5-Realtime 走实时通道。
 const MODELS = {
@@ -25,10 +28,8 @@ const MODELS = {
     ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, free: true,
     variants: { low: {}, medium: {}, high: {} },
   },
-  "MiniCPM-V-4.7-1B": {
-    ctx: 256000, image: true, video: true, toolcall: true, reasoning: true, free: true,
-    variants: { low: {}, medium: {}, high: {} },
-  },
+  // 开思考会把 max_tokens 全耗在推理上、content 为空（实测 256/1024/4096 全是 finish=length + 空正文）
+  "MiniCPM-V-4.7-1B": { ctx: 256000, image: true, video: true, toolcall: true, free: true },
   "MiniCPM-V-4.6": { ctx: 256000, image: true, video: true, toolcall: true, cost: [0.2, 1.6] },
   "MiniCPM-V-4.5": { ctx: 40000, image: true, video: true, toolcall: true, cost: [0.2, 1.6] },
   "MiniCPM5-2B": { ctx: 128000, cost: [0.15, 0.3] },
